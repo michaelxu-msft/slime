@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Union
 
 import aiohttp
@@ -14,11 +15,23 @@ from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
 
 
+def _parse_label(label):
+    """Parse label from JSON string if needed."""
+    if isinstance(label, str):
+        try:
+            return json.loads(label)
+        except (json.JSONDecodeError, ValueError):
+            # If it's not valid JSON, keep it as a string
+            return label
+    return label
+
+
 async def remote_rm(args, sample: Sample):
+    label = _parse_label(sample.label)
     payload = {
         "prompt": sample.prompt,
         "response": sample.response,
-        "label": sample.label,
+        "label": label["ground_truth"] if (isinstance(label, dict) and "ground_truth" in label) else label,
     }
     session_kwargs = {}
     async with aiohttp.ClientSession(**session_kwargs) as session:
@@ -35,7 +48,8 @@ async def async_rm(args, sample: Sample, **kwargs):
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
     response = sample.response
-    label = sample.label
+    parsed_label = _parse_label(sample.label)
+    label = parsed_label["ground_truth"] if (isinstance(parsed_label, dict) and "ground_truth" in parsed_label) else parsed_label
     if rm_type.startswith("boxed_"):
         response = extract_boxed_answer(response) or ""
         rm_type = rm_type[len("boxed_") :]

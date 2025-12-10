@@ -5,14 +5,11 @@ import os
 from typing import Any, Dict
 
 import yaml
-from sglang_router.launch_router import RouterArgs
 from transformers import AutoConfig
 
 from slime.backends.sglang_utils.arguments import add_sglang_arguments
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
-
-from slime.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +94,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--offload-train-mode",
+                choices=["tms", "move"],
+                default="tms",
+                help="Approach to offload training engine",
+            )
+            parser.add_argument(
                 "--offload-rollout",
                 action=argparse.BooleanOptionalAction,
                 help=(
@@ -141,12 +144,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_false",
                 dest="enable_weights_backuper",
                 help="Whether to disable weights backuper to save host memory.",
-            )
-            parser.add_argument(
-                "--megatron-to-hf-mode",
-                choices=["raw", "bridge"],
-                default="raw",
-                help="The method to convert megatron weights to hugging face weights for SGLang.",
             )
 
             return parser
@@ -447,13 +444,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--prompt-data",
                 type=str,
+                nargs="+",
                 default=None,
                 help=(
-                    "The path to the prompt data. "
-                    "Currently we only support jsonl format, and each line should contains --input-key and --label-key, "
+                    "The path(s) to the prompt data. Can be a single file or multiple files. "
+                    "Currently we only support jsonl and parquet formats. Each line/row should contain --input-key and --label-key, "
                     "which will be used as the prompt and the label respectively. "
                     "If you want to use a custom template, you can set --apply-chat-template to true, in that case, "
-                    "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
+                    "the input should be the same structure as an openai message, e.g. [\{'role': 'user', 'content': 'blabla'\}]. "
+                    "Example: --prompt-data file1.parquet file2.parquet file3.jsonl"
                 ),
             )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
@@ -610,9 +609,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-top-p", type=float, default=None)
             parser.add_argument("--eval-top-k", type=int, default=None)
             parser.add_argument("--eval-max-response-len", type=int, default=None)
-            parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
-            parser.add_argument("--eval-max-context-len", type=int, default=None)
 
             return parser
 
@@ -722,6 +719,51 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="KL penalty coefficient for the loss function. This is added to the final PPO loss.",
             )
             parser.add_argument(
+                "--use-flowrl-objective",
+                action="store_true",
+                default=False,
+                help="Enable Flow Matching RL objective for the actor update.",
+            )
+            parser.add_argument(
+                "--flowrl-beta",
+                type=float,
+                default=15.0,
+                help="Temperature parameter (beta) used in the FlowRL residual objective.",
+            )
+            parser.add_argument(
+                "--flowrl-max-importance-weight",
+                type=float,
+                default=None,
+                help="Optional cap on importance weights in FlowRL (set <=0 to disable).",
+            )
+            parser.add_argument(
+                "--flowrl-partition-lr",
+                type=float,
+                default=None,
+                help="Learning rate override for the FlowRL partition head (ProjZ).",
+            )
+            parser.add_argument(
+                "--flowrl-partition-num-layers",
+                type=int,
+                default=3,
+                help="Number of layers in the FlowRL partition head.",
+            )
+            parser.add_argument(
+                "--flowrl-partition-dropout",
+                type=float,
+                default=0.1,
+                help="Dropout probability applied inside the FlowRL partition head.",
+            )
+            parser.add_argument(
+                "--flowrl-detach-prompt-hidden",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Detach prompt hidden states before feeding them to the FlowRL partition head. "
+                    "Use --no-flowrl-detach-prompt-hidden to allow gradients into the prompt encoder."
+                ),
+            )
+            parser.add_argument(
                 "--ref-update-interval",
                 type=int,
                 default=None,
@@ -751,12 +793,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to calculate the entropy when calculating the logprobs from actor and reference model. "
                     "This is useful for doing special loss mask."
                 ),
-            )
-            parser.add_argument(
-                "--get-mismatch-metrics",
-                action="store_true",
-                default=False,
-                help="Whether to calculate the mismatch metrics.",
             )
             parser.add_argument(
                 "--use-rollout-logprobs",
@@ -790,7 +826,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--custom-tis-function-path",
                 type=str,
                 default=None,
-                help="Path to the custom TIS/RS function (e.g., examples/train_infer_mismatch_helper/mis.py:compute_mis_weights_with_cp).",
+                help="Path to the custom TIS function.",
             )
 
             parser.add_argument(
@@ -820,19 +856,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 nargs="+",
                 default="",
             )
-            parser.add_argument(
-                "--slime-router-timeout",
-                type=float,
-                default=None,
-                help="Timeout for SlimeRouter HTTP requests in seconds.",
-            )
-            parser.add_argument(
-                "--slime-router-max-connections",
-                type=int,
-                default=None,
-                help="Max connections for SlimeRouter HTTP client.",
-            )
-            RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
         # wandb
@@ -999,7 +1022,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["torch", "memray"],
                 default="torch",
             )
-            parser.add_argument("--check-weight-update-equal", action="store_true")
             return parser
 
         def add_network_arguments(parser):
@@ -1056,6 +1078,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Path to the custom function that will post process reward, by default it will be the normalization for grpo. "
                 ),
             )
+            parser.add_argument(
+                "--sandbox-url",
+                type=str,
+                default=None,
+                help=(
+                    "URL for the SandboxFusion API endpoint for code evaluation. "
+                    "Example: https://sandboxfusion-api.net"
+                ),
+            )
+            parser.add_argument(
+                "--sandbox-timeout",
+                type=int,
+                default=30,
+                help="Maximum execution time in seconds for SandboxFusion code evaluation (default: 30)",
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):
@@ -1089,24 +1126,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="qwen",
                 choices=["qwen", "qwen3", "distill_qwen"],
                 help="Loss mask type",
-            )
-            parser.add_argument(
-                "--data-pad-size-multiplier",
-                type=int,
-                default=128,
-                help="Multiplier for data padding size in data processing.",
-            )
-            parser.add_argument(
-                "--rollout-sample-filter-path",
-                type=str,
-                default=None,
-                help=(
-                    "Path to the rollout sample filter function. "
-                    "This function determines whether a sample will participate in loss calculation. "
-                    "The function should take args and samples (list[Sample]) as input, and return None. "
-                    "Please directly modify the remove_sample attribute of Sample. "
-                    "Note: This attribute does not determine whether the sample participates in advantage normalization."
-                ),
             )
             return parser
 
@@ -1216,9 +1235,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
 
 def parse_args(add_custom_arguments=None):
-    # Users may call `parse_args` very early, thus we ensure logger is configured here
-    configure_logger()
-
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     backend = parse_args_train_backend()
@@ -1323,7 +1339,10 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
-    if args.kl_coef != 0 or args.use_kl_loss:
+    if args.flowrl_max_importance_weight is not None and args.flowrl_max_importance_weight <= 0:
+        args.flowrl_max_importance_weight = None
+
+    if args.kl_coef != 0 or args.use_kl_loss or args.use_flowrl_objective:
         if not os.path.exists(args.ref_load):
             raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
 
@@ -1331,6 +1350,27 @@ def slime_validate_args(args):
             logger.info(
                 f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
                 "please make sure it is a valid megatron checkpoint directory."
+            )
+
+    if args.use_flowrl_objective:
+        if args.loss_type != "policy_loss":
+            raise ValueError("FlowRL objective currently supports only policy_loss.")
+        if args.advantage_estimator not in {"grpo", "gspo"}:
+            raise ValueError("FlowRL objective requires --advantage-estimator grpo or gspo.")
+        if args.use_tis:
+            raise ValueError("FlowRL objective is incompatible with --use-tis.")
+        if args.flowrl_beta <= 0:
+            raise ValueError("--flowrl-beta must be positive.")
+        if args.flowrl_partition_num_layers < 1:
+            raise ValueError("--flowrl-partition-num-layers must be >= 1.")
+        if args.flowrl_partition_dropout < 0:
+            raise ValueError("--flowrl-partition-dropout must be non-negative.")
+        if args.flowrl_max_importance_weight is not None and args.flowrl_max_importance_weight <= 0:
+            args.flowrl_max_importance_weight = None
+        if args.optimizer == "deepspeed_cpu_adam" and args.flowrl_partition_lr is not None:
+            print(
+                "Warning: flowrl_partition_lr cannot be applied with DeepSpeed CPU Adam optimizer; "
+                "the base learning rate will be used for all parameters."
             )
 
     # TODO: During loading, we need to set the start_rollout_id here.
@@ -1363,16 +1403,6 @@ def slime_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
-
-    if args.get_mismatch_metrics:
-        assert (
-            args.custom_tis_function_path is not None
-        ), "custom_tis_function_path must be set when get_mismatch_metrics is set"
-
-        if args.use_rollout_logprobs:
-            logger.info(
-                "get_mismatch_metrics is set; For metrics calculation, the log probs will still be recomputed by training engine. One more forward pass will be applied."
-            )
 
     if args.use_dynamic_batch_size:
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
@@ -1419,9 +1449,6 @@ def slime_validate_args(args):
             args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
         args.colocate = False
         args.offload_train = args.offload_rollout = False
-        if args.train_memory_margin_bytes > 0:
-            logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
-            args.train_memory_margin_bytes = 0
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
@@ -1501,38 +1528,14 @@ def slime_validate_args(args):
         with open(args.custom_config_path, "r") as f:
             data = yaml.safe_load(f) or {}
         for k, v in data.items():
-            if hasattr(args, k):
-                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
-            setattr(args, k, v)
-
-    if args.rollout_max_context_len is None:
-        logger.info(
-            f"args.rollout_max_context_len is not set. Use args.rollout_max_response_len {args.rollout_max_response_len} as default value."
-        )
-        args.rollout_max_context_len = args.rollout_max_response_len
-
-    if args.eval_max_context_len is None:
-        logger.info(
-            f"args.eval_max_context_len is not set. Use args.rollout_max_context_len {args.rollout_max_context_len} as default value."
-        )
-        args.eval_max_context_len = args.rollout_max_context_len
-
-    if args.rollout_max_prompt_len is None:
-        logger.info(
-            f"args.rollout_max_prompt_len is not set. Use args.rollout_max_context_len - 1 ({args.rollout_max_context_len} - 1) as default value so that there is at least one generated token to compute loss."
-        )
-        args.rollout_max_prompt_len = args.rollout_max_context_len - 1
-
-    assert (
-        args.rollout_max_prompt_len <= args.rollout_max_context_len - 1
-    ), f"args.rollout_max_prompt_len ({args.rollout_max_prompt_len}) must be smaller than args.rollout_max_context_len ({args.rollout_max_context_len}) so that there is at least one generated token to compute loss."
+            if not hasattr(args, k):
+                setattr(args, k, v)
+            else:
+                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will not override with {v}.")
 
 
 def hf_validate_args(args, hf_config):
     equal = lambda x, y: x == y
-
-    errors = []
-
     for hf_config_name, megatron_config_name, compare_fn in [
         ("hidden_size", "hidden_size", equal),
         ("num_attention_heads", "num_attention_heads", equal),
@@ -1543,14 +1546,10 @@ def hf_validate_args(args, hf_config):
         ("rope_theta", "rotary_base", equal),
     ]:
         if hasattr(hf_config, hf_config_name):
-            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
-                errors.append(
-                    f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
-                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
-                )
-
-    if len(errors) > 0:
-        raise AssertionError(f"hf_validate_args failed: " + "; ".join(errors))
+            assert compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)), (
+                f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
+                f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+            )
 
 
 def _validate_and_update_megatron_args_from_hf(args, args_from_hf_config: Dict[str, Any]):

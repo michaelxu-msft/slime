@@ -208,7 +208,10 @@ def is_correct_minerva(
     else:
         gt = normalize_final_answer(gt)
 
-    gt = str(int(float(gt)))  # in dapo, all answers are integers
+    try:
+        gt = str(int(float(gt)))  # prefer numeric comparison when possible
+    except (ValueError, TypeError):
+        gt = gt.strip()
 
     return (pred == gt), pred
 

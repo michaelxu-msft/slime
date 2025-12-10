@@ -63,54 +63,59 @@ class Dataset:
         apply_chat_template_kwargs=None,
     ):
         self.origin_samples = []
-        for data in read_file(path):
-            if multimodal_keys:
-                prompt_content = []
-                if prompt_key in data:
-                    prompt_content.append({"type": "text", "text": data[prompt_key]})
-                for media_type, data_key in multimodal_keys.items():
-                    if data_key in data:
-                        media_path = data[data_key]
-                        prompt_content.append({"type": media_type, "path": media_path})
-            else:
-                prompt_content = data.get(prompt_key)
-
-            if apply_chat_template:
-                if tool_key is not None:
-                    tools = data[tool_key]
-                    if isinstance(tools, str):
-                        tools = json.loads(tools)
-                    elif isinstance(tools, np.ndarray):
-                        tools = tools.tolist()
-                    assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
+        
+        # Support both single path (string) and multiple paths (list)
+        paths = [path] if isinstance(path, str) else path
+        
+        for single_path in paths:
+            for data in read_file(single_path):
+                if multimodal_keys:
+                    prompt_content = []
+                    if prompt_key in data:
+                        prompt_content.append({"type": "text", "text": data[prompt_key]})
+                    for media_type, data_key in multimodal_keys.items():
+                        if data_key in data:
+                            media_path = data[data_key]
+                            prompt_content.append({"type": media_type, "path": media_path})
                 else:
-                    tools = None
-                template_input = [{"role": "user", "content": prompt_content}] if multimodal_keys else prompt_content
-                prompt = tokenizer.apply_chat_template(
-                    template_input,
-                    tools,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    **apply_chat_template_kwargs,
+                    prompt_content = data.get(prompt_key)
+
+                if apply_chat_template:
+                    if tool_key is not None:
+                        tools = data[tool_key]
+                        if isinstance(tools, str):
+                            tools = json.loads(tools)
+                        elif isinstance(tools, np.ndarray):
+                            tools = tools.tolist()
+                        assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
+                    else:
+                        tools = None
+                    template_input = [{"role": "user", "content": prompt_content}] if multimodal_keys else prompt_content
+                    prompt = tokenizer.apply_chat_template(
+                        template_input,
+                        tools,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **apply_chat_template_kwargs,
+                    )
+
+                else:
+                    prompt = prompt_content
+
+                # TODO: this is slow.
+                if max_length is not None:
+                    raw_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                    if not multimodal_keys:
+                        if len(raw_prompt_ids) > max_length:
+                            continue
+
+                self.origin_samples.append(
+                    Sample(
+                        prompt=prompt,
+                        label=data[label_key] if label_key is not None else None,
+                        metadata=data.get(metadata_key) or {},
+                    )
                 )
-
-            else:
-                prompt = prompt_content
-
-            # TODO: this is slow.
-            if max_length is not None:
-                raw_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-                if not multimodal_keys:
-                    if len(raw_prompt_ids) > max_length:
-                        continue
-
-            self.origin_samples.append(
-                Sample(
-                    prompt=prompt,
-                    label=data[label_key] if label_key is not None else None,
-                    metadata=data.get(metadata_key) or {},
-                )
-            )
 
         self.epoch_id = -1
         self.seed = seed

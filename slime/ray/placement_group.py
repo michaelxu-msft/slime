@@ -141,7 +141,11 @@ def create_training_models(args, pgs, rollout_manager):
         critic_model = None
 
     start_rollout_ids = ray.get(
-        actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
+        actor_model.async_init(
+            args,
+            role="actor",
+            with_ref=(args.kl_coef != 0 or args.use_kl_loss or args.use_flowrl_objective),
+        )
     )
 
     assert len(set(start_rollout_ids)) == 1

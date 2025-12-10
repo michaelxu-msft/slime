@@ -1,12 +1,19 @@
 import logging
 from argparse import Namespace
+from contextlib import nullcontext
 from itertools import accumulate
 
 import ray
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.nn as nn
+import wandb
+from packaging import version
 from ring_flash_attn import substitute_hf_flash_attn, update_ring_flash_attn_params
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+from torch.distributed.tensor import DTensor, distribute_tensor
+from torch_memory_saver import torch_memory_saver
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
@@ -26,9 +33,41 @@ from ...utils import tracking_utils
 from ...utils.profile_utils import TrainProfiler
 from . import checkpoint
 from .data_packing import pack_sequences, pad_packed_sequence_with_cp, unpack_sequences
+from .fsdp_cpu_adam_wrapper import FSDPCPUAdamWrapper
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
 
 logger = logging.getLogger(__name__)
+
+
+class FlowRLProjZ(nn.Module):
+    """Lightweight MLP head used to approximate FlowRL partition log Z."""
+
+    def __init__(self, hidden_size: int, num_layers: int = 3, dropout: float = 0.1) -> None:
+        super().__init__()
+
+        layers: list[nn.Module] = []
+        for _ in range(max(num_layers - 1, 0)):
+            layers.append(nn.Linear(hidden_size, hidden_size))
+            layers.append(nn.GELU())
+            layers.append(nn.LayerNorm(hidden_size))
+            if dropout > 0:
+                layers.append(nn.Dropout(p=dropout))
+        layers.append(nn.Linear(hidden_size, 1))
+        self.net = nn.Sequential(*layers)
+        
+        # Initialize with small weights to prevent initial instability
+        self._init_weights()
+    
+    def _init_weights(self) -> None:
+        """Initialize weights with small values for stability."""
+        for module in self.net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
 
 
 class FSDPTrainRayActor(TrainRayActor):
@@ -48,21 +87,32 @@ class FSDPTrainRayActor(TrainRayActor):
     def init(self, args: Namespace, role: str, with_ref: bool = False) -> int:  # type: ignore[override]
         super().init(args, role, with_ref)
 
-        # Setup device mesh for parallelism (handles both CP and non-CP cases)
-        self._setup_device_mesh()
-        torch.manual_seed(args.seed)
+        # TODO extract to function
+        if args.true_on_policy_mode:
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+            from transformers.models.qwen3 import modeling_qwen3
 
-        if self.args.debug_rollout_only:
-            return 0
+            logger.info("FSDPTrainRayActor call enable_batch_invariant_mode for true-on-policy")
+            enable_batch_invariant_mode(
+                # In Qwen3, rope `inv_freq_expanded.float() @ position_ids_expanded.float()` uses bmm
+                # and disabling it will make it aligned
+                enable_bmm=False,
+            )
 
-        self.fsdp_cpu_offload = getattr(self.args, "fsdp_cpu_offload", False)
-        # Offload train and fsdp cpu offload cannot be used together, fsdp_cpu_offload is more aggressive
-        if self.args.offload_train and self.fsdp_cpu_offload:
-            self.args.offload_train = False
+            modeling_qwen3.apply_rotary_pos_emb = torch.compile(dynamic=True)(modeling_qwen3.apply_rotary_pos_emb)
 
-        self._enable_true_on_policy_optimizations(args)
+        # Update rank and world_size for wandb secondary initialization (using actual distributed values)
+        args.rank = dist.get_rank()
+        args.world_size = dist.get_world_size()
+
         if dist.get_rank() == 0:
             init_tracking(args, primary=False)
+
+        self.args = args
+        self.fsdp_full_state_dict_opts = StateDictOptions(
+            full_state_dict=True, cpu_offload=getattr(self.args, "fsdp_state_dict_cpu_offload", False)
+        )
+        torch.manual_seed(args.seed)
 
         if getattr(self.args, "start_rollout_id", None) is None:
             self.args.start_rollout_id = 0
@@ -78,55 +128,107 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.multimodal_keys:
             self.vlm_processor = AutoProcessor.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
 
-        init_context = self._get_init_weight_context_manager()
-
-        with init_context():
+        # Load model
+        with torch.autocast(device_type=f"cuda:{torch.cuda.current_device()}"):
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.hf_checkpoint,
                 trust_remote_code=True,
                 attn_implementation=self.args.attn_implementation,
             )
-
         model.train()
 
-        full_state = model.state_dict()
+        if args.use_flowrl_objective:
+            hidden_size = getattr(self.hf_config, "hidden_size", None)
+            if hidden_size is None:
+                hidden_size = getattr(self.hf_config, "n_embd", None)
+            if hidden_size is None:
+                raise ValueError("FlowRL objective requires `hidden_size` in HF config.")
 
-        model = apply_fsdp2(model, mesh=self.dp_mesh, cpu_offload=self.fsdp_cpu_offload)
+            partition_layers = max(1, args.flowrl_partition_num_layers)
+            partition_dropout = max(0.0, args.flowrl_partition_dropout)
+            model.proj_z = FlowRLProjZ(hidden_size, partition_layers, partition_dropout)
 
-        model = self._fsdp2_load_full_state_dict(
-            model, full_state, self.dp_mesh, cpu_offload=True if self.fsdp_cpu_offload else None
-        )
-
-        self.model = model
+            # Ensure newly added head matches existing parameter dtype/device before FSDP wrapping.
+            reference_param = next(model.parameters())
+            model.proj_z.to(device=reference_param.device, dtype=reference_param.dtype)
 
         if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+            model.gradient_checkpointing_enable()
 
-        if args.optimizer == "adam":
+        # Setup device mesh for parallelism (handles both CP and non-CP cases)
+        self.setup_device_mesh()
+        checkpoint_payload = checkpoint.load(self)
+        if checkpoint_payload is not None and checkpoint_payload.get("model") is not None:
+            load_info = model.load_state_dict(
+                checkpoint_payload["model"], strict=not args.use_flowrl_objective
+            )
+            if args.use_flowrl_objective:
+                missing = [k for k in load_info.missing_keys if not k.startswith("proj_z.")]
+                unexpected = [k for k in load_info.unexpected_keys if not k.startswith("proj_z.")]
+                if missing or unexpected:
+                    raise RuntimeError(
+                        "Checkpoint incompatibility detected when enabling FlowRL objective; "
+                        f"missing keys: {missing}, unexpected keys: {unexpected}"
+                    )
+            checkpoint_payload["model"] = None
+
+        # Apply FSDP with DP mesh
+        self.model = apply_fsdp2(model, mesh=self.dp_mesh)
+
+        if args.optimizer == "deepspeed_cpu_adam":
+            optimizer_config = {
+                "lr": args.lr,
+                "betas": (args.adam_beta1, args.adam_beta2),
+                "eps": args.adam_eps,
+                "weight_decay": args.weight_decay,
+                "adamw_mode": True,  # Use AdamW mode (decoupled weight decay)
+                "fp32_optimizer_states": True,  # Keep optimizer states in FP32
+            }
+
+            self.optimizer = FSDPCPUAdamWrapper(optimizer_config, self.model)
+
+        elif args.optimizer == "adam":
+            if args.use_flowrl_objective and args.flowrl_partition_lr is not None and hasattr(self.model, "proj_z"):
+                proj_params = list(self.model.proj_z.parameters())
+                proj_param_ids = {id(p) for p in proj_params}
+                base_params = [p for p in self.model.parameters() if id(p) not in proj_param_ids]
+                param_groups = []
+                if base_params:
+                    param_groups.append({"params": base_params, "lr": args.lr})
+                if proj_params:
+                    param_groups.append({"params": proj_params, "lr": args.flowrl_partition_lr})
+            else:
+                param_groups = [{"params": self.model.parameters()}]
+
             self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
+                param_groups,
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 eps=args.adam_eps,
                 weight_decay=args.weight_decay,
             )
+
         else:
-            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
+            raise ValueError(
+                f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam', 'deepspeed_cpu_adam'"
+            )
 
         self.global_step = 0
         self.micro_step = 0
+        self.weights = {"actor": {}}
 
         checkpoint_payload = checkpoint.load(self)
 
-        # Create separate ref model if needed (kept in CPU until needed)
         self.ref_model = None
         if with_ref:
-            self.ref_model = self._create_ref_model(args.ref_load)
+            self.load_ref_model(args.ref_load)
+
+        self.update_cpu_params_dict(self.weights["actor"])
 
         self.weight_updater = (
-            UpdateWeightFromTensor(self.args, self.model)
+            UpdateWeightFromTensor(self.args, self.model, self.weights)
             if self.args.colocate
-            else UpdateWeightFromDistributed(self.args, self.model)
+            else UpdateWeightFromDistributed(self.args, self.model, self.weights)
         )
 
         checkpoint.finalize_load(self, checkpoint_payload)
@@ -141,21 +243,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         return int(getattr(self.args, "start_rollout_id", 0))
 
-    def _enable_true_on_policy_optimizations(self, args):
-        if args.true_on_policy_mode:
-            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
-            from .models.qwen3_moe import apply_true_on_policy_patch_for_qwen3_moe
-
-            logger.info("FSDPTrainRayActor call enable_batch_invariant_mode for true-on-policy")
-            enable_batch_invariant_mode(
-                # In Qwen3, rope `inv_freq_expanded.float() @ position_ids_expanded.float()` uses bmm
-                # and disabling it will make it aligned
-                enable_bmm=False,
-            )
-
-            apply_true_on_policy_patch_for_qwen3_moe()
-
-    def _setup_device_mesh(self) -> None:
+    def setup_device_mesh(self) -> None:
         """Setup device mesh for parallelism (always called, handles both CP and non-CP cases).
 
         Creates 2D mesh (dp_size, cp_size) for all cases:
@@ -202,69 +290,6 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             logger.info(f"[Rank {rank}] Pure DP mode (cp_size=1)")
 
-    def _get_init_weight_context_manager(self):
-        """Get context manager for model initialization.
-
-        Returns a callable that creates a context manager.
-        Uses meta device (no memory allocation) for non-rank-0 processes,
-        UNLESS tie_word_embeddings=True (which causes hangs with meta tensors).
-
-        Ref: verl/utils/fsdp_utils.py::get_init_weight_context_manager
-        NOTE: tie_word_embedding causes meta_tensor init to hang
-        """
-        from accelerate import init_empty_weights
-
-        # Check if model uses tied word embeddings (which doesn't work with meta tensors)
-        use_meta_tensor = not self.hf_config.tie_word_embeddings
-
-        cpu_init_weights = lambda: torch.device("cpu")
-
-        if use_meta_tensor:
-            # Rank 0: CPU, others: meta device (memory efficient for large models)
-            return init_empty_weights if dist.get_rank() != 0 else cpu_init_weights
-        else:
-            logger.info(f"[Rank {dist.get_rank()}] tie_word_embeddings=True, loading full model to CPU on all ranks")
-            return cpu_init_weights
-
-    def _fsdp2_load_full_state_dict(self, model, full_state, device_mesh, cpu_offload):
-        """Load full state dict into FSDP2 model with efficient broadcast from rank 0.
-
-        This function loads weights from rank 0 and broadcasts to all other ranks,
-        avoiding the need for each rank to load the full model from disk.
-
-        Args:
-            model: FSDP2-wrapped model
-            full_state: State dict (only rank 0 has real weights, others have empty dict)
-            device_mesh: Device mesh for FSDP
-            cpu_offload: If not None, enables StateDictOptions cpu_offload
-
-        Ref:verl/utils/fsdp_utils.py::fsdp2_load_full_state_dict
-        """
-        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
-
-        # Rank 0: move with weights, others: allocate empty tensors on device
-        if dist.get_rank() == 0:
-            model = model.to(device=torch.cuda.current_device(), non_blocking=True)
-        else:
-            # to_empty creates tensors on device without initializing memory
-            model = model.to_empty(device=torch.cuda.current_device())
-
-        is_cpu_offload = cpu_offload is not None
-        options = StateDictOptions(full_state_dict=True, cpu_offload=is_cpu_offload, broadcast_from_rank0=True)
-
-        set_model_state_dict(model, full_state, options=options)
-
-        # set_model_state_dict will not broadcast buffers, so we need to broadcast them manually.
-        for name, buf in model.named_buffers():
-            dist.broadcast(buf, src=0)
-
-        if is_cpu_offload:
-            model.to("cpu", non_blocking=True)
-            for buf in model.buffers():
-                buf.data = buf.data.to(torch.cuda.current_device())
-
-        return model
-
     @timer
     def sleep(self) -> None:
         """Pause CUDA memory for all tracked tensors."""
@@ -273,9 +298,24 @@ class FSDPTrainRayActor(TrainRayActor):
 
         print_memory("before offload model")
 
-        self.model.cpu()
-        move_torch_optimizer(self.optimizer, "cpu")
-        clear_memory()
+        match self.args.offload_train_mode:
+            case "tms":
+                # Try to avoid this case:
+                # * FSDP contains a lot of cached memory and sleep
+                # * SGLang resumes and allocate some memory
+                # * FSDP resumes but realize there is no enough memory, thus OOM currently, but indeed the cache can be (partially) freed to fulfill requirements
+                # TODO: improve it later
+                clear_memory()
+
+                torch_memory_saver.pause()
+            case "move":
+                self.model.cpu()
+                move_torch_optimizer(self.optimizer, "cpu")
+                clear_memory()
+            case _:
+                raise NotImplementedError
+
+        torch.cuda.synchronize()
         dist.barrier(group=get_gloo_group())
         print_memory("after offload model")
 
@@ -285,8 +325,16 @@ class FSDPTrainRayActor(TrainRayActor):
         if not self.args.offload_train:
             return
 
-        self.model.cuda()
-        move_torch_optimizer(self.optimizer, "cuda")
+        match self.args.offload_train_mode:
+            case "tms":
+                torch_memory_saver.resume()
+            case "move":
+                self.model.cuda()
+                move_torch_optimizer(self.optimizer, "cuda")
+            case _:
+                raise NotImplementedError
+
+        torch.cuda.synchronize()
         dist.barrier(group=get_gloo_group())
         print_memory("after wake_up model")
 
@@ -297,7 +345,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         checkpoint.save(self, iteration)
 
-    def _compute_log_prob(
+    def compute_log_prob(
         self,
         model_tag: str,
         packed_batches: list[dict[str, torch.Tensor]],
@@ -318,20 +366,15 @@ class FSDPTrainRayActor(TrainRayActor):
             `packed_batches` under the same key and can be read back by callers.
 
         Note:
-            Uses separate ref model when model_tag == "ref". The ref model is
-            loaded from CPU to GPU on-demand and offloaded back after use.
+            This method temporarily switches model weights when `model_tag != "actor"`
+            and restores the original weights and train mode afterwards.
         """
-        # Select which model to use
-        if model_tag == "ref" and self.ref_model is not None:
-            if not self.fsdp_cpu_offload:
-                self.model.cpu()
-                torch.cuda.empty_cache()
-                dist.barrier(group=get_gloo_group())
-
-            active_model = self.ref_model
-            active_model.eval()
-        else:
-            active_model = self.model
+        need_restore = False
+        if model_tag != "actor" and model_tag in self.weights:
+            self.update_cpu_params_dict(self.weights["actor"])
+            self.update_gpu_params_dict(self.weights[model_tag])
+            self.model.eval()
+            need_restore = True
 
         try:
             rollout_data = {f"{store_prefix}log_probs": []}
@@ -339,36 +382,33 @@ class FSDPTrainRayActor(TrainRayActor):
                 for batch in self.prof.iterate_train_log_probs(
                     tqdm(packed_batches, desc=f"{store_prefix}log_probs", disable=dist.get_rank() != 0)
                 ):
-                    model_args = self._get_model_inputs_args(batch)
-                    if "pixel_values" in batch:
-                        model_args["pixel_values"] = batch["pixel_values"]
-                    logits = active_model(**model_args).logits.squeeze(0).float()
-                    log_probs_result, entropy_result = get_logprob_and_entropy_with_cp(
-                        logits=logits,
-                        target_tokens=batch["tokens"],
-                        cp_rank=self.cp_rank,
-                        cp_size=self.cp_size,
-                        cp_group=self.cp_group,
-                        model_input_ids=model_args["input_ids"],
-                        allow_compile=not self.args.true_on_policy_mode,
-                        temperature=self.args.rollout_temperature,
-                    )
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        model_args = self._get_model_inputs_args(batch)
+                        if "pixel_values" in batch:
+                            model_args["pixel_values"] = batch["pixel_values"]
+                        logits = self.model(**model_args).logits.squeeze(0)
+                        log_probs_result, entropy_result = get_logprob_and_entropy_with_cp(
+                            logits=logits,
+                            target_tokens=batch["tokens"],
+                            cp_rank=self.cp_rank,
+                            cp_size=self.cp_size,
+                            cp_group=self.cp_group,
+                            model_input_ids=model_args["input_ids"],
+                            allow_compile=not self.args.true_on_policy_mode,
+                            temperature=self.args.rollout_temperature,
+                        )
                     batch[f"{store_prefix}log_probs"] = log_probs_result
                     if store_prefix == "":
                         batch["entropy"] = entropy_result
             return rollout_data
 
         finally:
-            # Restore actor model if it was offloaded
-            if model_tag == "ref" and self.ref_model is not None:
-                torch.cuda.empty_cache()
-                dist.barrier(group=get_gloo_group())
+            if need_restore:
+                self.update_gpu_params_dict(self.weights["actor"])
+                self.model.train()
+                torch.cuda.synchronize()
 
-                if not self.fsdp_cpu_offload:
-                    self.model.cuda()
-                    dist.barrier(group=get_gloo_group())
-
-    def _packed_data(
+    def packed_data(
         self, rollout_data: dict[str, list[torch.Tensor]]
     ) -> tuple[list[dict[str, torch.Tensor]], list[int]]:
         """Pack variable-length sequences for efficient processing.
@@ -394,16 +434,11 @@ class FSDPTrainRayActor(TrainRayActor):
         ), f"global_batch_size {self.args.global_batch_size} is not divisible by dp_world_size {self.dp_size}"
         # Use global_batch_size for splitting when max_tokens_per_gpu is enabled
         if self.args.use_dynamic_batch_size:
-            # In CP mode, CP group shares sequences, so total capacity is max_tokens_per_gpu * cp_size
-            max_tokens = self.args.max_tokens_per_gpu
-            if self.cp_size > 1:
-                max_tokens = max_tokens * self.cp_size
-
             for i in range(0, len(tokens), local_batch_size):
                 mbs_size_list.append(
                     get_minimum_num_micro_batch_size(
                         [len(t) for t in rollout_data["tokens"][i : i + local_batch_size]],
-                        max_tokens,
+                        self.args.max_tokens_per_gpu,
                     )
                 )
             num_microbatches = torch.tensor(mbs_size_list, dtype=torch.int, device=torch.cuda.current_device())
@@ -452,10 +487,7 @@ class FSDPTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with inverse_timer("train_wait"), timer("train"):
-            rollout_data = process_rollout_data(self.args, rollout_data_ref, self.dp_rank, self.dp_size)
-            if self.args.debug_rollout_only:
-                return
-            self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
+            self._train_core(rollout_id=rollout_id, rollout_data_ref=rollout_data_ref)
 
         train_metric_utils.log_perf_data_raw(
             rollout_id=rollout_id,
@@ -464,14 +496,31 @@ class FSDPTrainRayActor(TrainRayActor):
             compute_total_fwd_flops=None,
         )
 
-    def _log_rollout_data(self, rollout_id: int, rollout_data, packed_batches):
-        log_dict = {}
-        if "raw_reward" in rollout_data and dist.get_rank() == 0:
-            raw_reward_list = rollout_data["raw_reward"]
-            if raw_reward_list:
-                log_dict["rollout/raw_reward"] = sum(raw_reward_list) / len(raw_reward_list)
+    def _train_core(self, rollout_id: int, rollout_data_ref: Box) -> None:
+        rank = dist.get_rank()
 
-        for metric_key in ["log_probs", "rollout_log_probs", "ref_log_probs", "advantages", "returns"]:
+        rollout_data = process_rollout_data(self.args, rollout_data_ref, self.dp_rank, self.dp_size)
+        if self.args.advantage_estimator in ["grpo", "gspo"]:
+            rollout_data["advantages"] = rollout_data["returns"] = [
+                torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
+                for i in range(len(rollout_data["rewards"]))
+            ]
+        else:
+            raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
+
+        packed_batches, grad_accum = self.packed_data(rollout_data)
+        log_dict = {}
+
+        assert (
+            len(grad_accum) > 0
+        ), f"Invalid grad_accum {grad_accum} for micro_batch_size {self.args.micro_batch_size} and global_batch_size {self.args.global_batch_size}"
+
+        if "ref" in self.weights:
+            self.compute_log_prob("ref", packed_batches, store_prefix="ref_")
+
+        self.compute_log_prob("actor", packed_batches)
+
+        for metric_key in ["log_probs", "ref_log_probs", "advantages", "returns", "raw_reward"]:
             if metric_key not in packed_batches[0]:
                 continue
             val = torch.tensor([0.0], device=torch.cuda.current_device())
@@ -493,34 +542,6 @@ class FSDPTrainRayActor(TrainRayActor):
             log_dict["rollout/step"] = compute_rollout_step(self.args, rollout_id)
             tracking_utils.log(self.args, log_dict, step_key="rollout/step")
 
-        if self.args.ci_test and self.args.true_on_policy_mode:
-            assert log_dict["rollout/log_probs"] == log_dict["rollout/rollout_log_probs"], (
-                f"CI check failed: true_on_policy_mode is enabled, but log_probs "
-                f"({log_dict['rollout/log_probs']}) != rollout_log_probs "
-                f"({log_dict['rollout/rollout_log_probs']})"
-            )
-
-    def _train_core(self, rollout_id: int, rollout_data) -> None:
-        if self.args.advantage_estimator in ["grpo", "gspo"]:
-            rollout_data["advantages"] = rollout_data["returns"] = [
-                torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
-                for i in range(len(rollout_data["rewards"]))
-            ]
-        else:
-            raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
-
-        packed_batches, grad_accum = self._packed_data(rollout_data)
-
-        assert (
-            len(grad_accum) > 0
-        ), f"Invalid grad_accum {grad_accum} for micro_batch_size {self.args.micro_batch_size} and global_batch_size {self.args.global_batch_size}"
-
-        if self.ref_model is not None:
-            self._compute_log_prob("ref", packed_batches, store_prefix="ref_")
-
-        self._compute_log_prob("actor", packed_batches)
-        self._log_rollout_data(rollout_id, rollout_data, packed_batches)
-
         with timer("actor_train"):
             reported_accum: dict[str, list[torch.Tensor]] = {}
             self.optimizer.zero_grad(set_to_none=True)
@@ -538,154 +559,327 @@ class FSDPTrainRayActor(TrainRayActor):
 
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
-        # Update ref model if needed (copy actor weights to ref)
+        self.update_cpu_params_dict(self.weights["actor"])
+
+        # Update ref model if needed
         if (
             self.args.ref_update_interval is not None
             and (rollout_id + 1) % self.args.ref_update_interval == 0
-            and self.ref_model is not None
+            and "ref" in self.weights
         ):
             if dist.get_rank() == 0:
                 logger.info(f"Updating ref model at rollout_id {rollout_id}")
-            # Copy actor model state to ref model
-            actor_state = self.model.state_dict()
-            self.ref_model.load_state_dict(actor_state)
-            self.ref_model.cpu()
+            self.update_cpu_params_dict(self.weights["ref"])
 
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum):
-        # Prepare model inputs
-        model_args = self._get_model_inputs_args(packed_batch)
-        logits = self.model(**model_args).logits.squeeze(0).float()
+        if self.args.use_flowrl_objective and not hasattr(self.model, "proj_z"):
+            raise RuntimeError("FlowRL objective requires the proj_z head to be initialized.")
 
-        # Compute log probs and entropy (unified for both CP and non-CP modes)
-        log_probs, entropy_result = get_logprob_and_entropy_with_cp(
-            logits=logits,
-            target_tokens=packed_batch["tokens"],
-            cp_rank=self.cp_rank,
-            cp_size=self.cp_size,
-            cp_group=self.cp_group,
-            model_input_ids=model_args["input_ids"],
-            allow_compile=not self.args.true_on_policy_mode,
-            temperature=self.args.rollout_temperature,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # Prepare model inputs
+            model_args = self._get_model_inputs_args(packed_batch)
+            
+            if self.args.use_flowrl_objective:
+                outputs = self.model(
+                    **model_args,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+                logits = outputs.logits.squeeze(0)
+                hidden_states = getattr(outputs, "hidden_states", None)
+                if hidden_states is None or len(hidden_states) == 0:
+                    raise RuntimeError(
+                        "FlowRL objective requires model hidden states; please enable `output_hidden_states`."
+                    )
+            else:
+                logits = self.model(**model_args).logits.squeeze(0)
+                hidden_states = None
+            
+            # Compute log probs and entropy (unified for both CP and non-CP modes)
+            log_probs, entropy_result = get_logprob_and_entropy_with_cp(
+                logits=logits,
+                target_tokens=packed_batch["tokens"],
+                cp_rank=self.cp_rank,
+                cp_size=self.cp_size,
+                cp_group=self.cp_group,
+                model_input_ids=model_args["input_ids"],
+                allow_compile=not self.args.true_on_policy_mode,
+                temperature=self.args.rollout_temperature,
+            )
+        
         packed_batch["cur_log_probs"] = log_probs
         packed_batch["entropy"] = entropy_result
 
         unpacked_batches = unpack_sequences(packed_batch)
 
-        old_log_prob_key = "rollout_log_probs" if self.args.use_rollout_logprobs else "log_probs"
-        missing_old_log_probs = [
-            idx
-            for idx, batch in enumerate(unpacked_batches)
-            if old_log_prob_key not in batch or not isinstance(batch[old_log_prob_key], torch.Tensor)
-        ]
-        if missing_old_log_probs:
-            raise KeyError(
-                f"{old_log_prob_key} must be provided as torch.Tensor for all microbatches when "
-                f"use_rollout_logprobs is set to {self.args.use_rollout_logprobs}. Missing in batches: {missing_old_log_probs}"
-            )
-        old_log_probs = torch.cat([batch[old_log_prob_key] for batch in unpacked_batches], dim=0)
+        old_log_probs = torch.cat([batch["log_probs"] for batch in unpacked_batches], dim=0)
         log_probs = torch.cat([batch["cur_log_probs"] for batch in unpacked_batches], dim=0)
         advantages = torch.cat([batch["advantages"] for batch in unpacked_batches], dim=0)
         loss_masks = [batch["loss_masks"].to(device=log_probs.device) for batch in unpacked_batches]
         response_lengths = [batch["response_lengths"] for batch in unpacked_batches]
+        entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
 
-        advantages = advantages.to(device=log_probs.device)
-        ppo_kl = old_log_probs.to(device=log_probs.device) - log_probs
+        if self.args.use_flowrl_objective:
+            if not all("ref_log_probs" in batch for batch in unpacked_batches):
+                raise ValueError("FlowRL objective requires ref_log_probs in training batches.")
+            if not all("rollout_log_probs" in batch for batch in unpacked_batches):
+                raise ValueError("FlowRL objective requires rollout_log_probs in training batches.")
 
-        if self.args.advantage_estimator == "gspo":
-            log_ratio_splits = torch.split(ppo_kl, response_lengths, dim=0)
+        rollout_log_probs = torch.cat([batch["rollout_log_probs"] for batch in unpacked_batches], dim=0)
 
-            seq_kls = [
-                ((log_ratio_i * mask_i).sum() / mask_i.sum().clamp_min(1))
-                for log_ratio_i, mask_i in zip(log_ratio_splits, loss_masks)
-            ]
+        if self.args.use_flowrl_objective:
+            device = logits.device
+            cur_log_probs = log_probs.to(device=device)
+            old_log_probs = old_log_probs.to(device=device)
+            ref_log_probs = torch.cat([batch["ref_log_probs"] for batch in unpacked_batches], dim=0).to(device=device)
+            rollout_log_probs = rollout_log_probs.to(device=device)
+            advantages = advantages.to(device=device)
+            entropy = entropy.to(device=device)
+            flow_loss_masks = [mask.to(device=device, dtype=cur_log_probs.dtype) for mask in loss_masks]
+            response_lengths = [int(length) for length in response_lengths]
 
-            ppo_kl_list = []
-            for seq_kl, length in zip(seq_kls, response_lengths):
-                ppo_kl_list.append(seq_kl.expand(length))
+            entropy_loss = sum_of_sample_mean(entropy, response_lengths, flow_loss_masks)
 
-            ppo_kl = torch.cat(ppo_kl_list)
+            ppo_kl_tokens = old_log_probs - cur_log_probs
+            if self.args.advantage_estimator == "gspo":
+                log_ratio_splits = torch.split(ppo_kl_tokens, response_lengths, dim=0)
+                seq_kls = [
+                    ((log_ratio * mask).sum() / mask.sum().clamp_min(1))
+                    for log_ratio, mask in zip(log_ratio_splits, flow_loss_masks)
+                ]
+                expanded = [seq_kl.expand(length) for seq_kl, length in zip(seq_kls, response_lengths)]
+                ppo_kl_tokens = torch.cat(expanded, dim=0)
+            ppo_kl = sum_of_sample_mean(ppo_kl_tokens.abs(), response_lengths, flow_loss_masks)
 
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+            train_rollout_logprob_abs_diff = sum_of_sample_mean(
+                (old_log_probs - rollout_log_probs).abs(), response_lengths, flow_loss_masks
+            ).detach()
 
-        def _has_rollout_log_probs(batch) -> bool:
-            rollout_tensor = batch.get("rollout_log_probs")
-            return isinstance(rollout_tensor, torch.Tensor) and rollout_tensor.numel() > 0
+            cur_splits = torch.split(cur_log_probs, response_lengths, dim=0)
+            ref_splits = torch.split(ref_log_probs, response_lengths, dim=0)
+            old_splits = torch.split(old_log_probs, response_lengths, dim=0)
+            rollout_splits = torch.split(rollout_log_probs, response_lengths, dim=0)
+            adv_splits = torch.split(advantages, response_lengths, dim=0)
 
-        has_rollout_log_probs = all(_has_rollout_log_probs(batch) for batch in unpacked_batches)
-        rollout_log_probs = (
-            torch.cat([batch["rollout_log_probs"] for batch in unpacked_batches], dim=0)
-            if has_rollout_log_probs
-            else None
-        )
+            seq_log_prob = torch.stack([(cur * mask).sum() for cur, mask in zip(cur_splits, flow_loss_masks)], dim=0)
+            seq_ref_log_prob = torch.stack([(ref * mask).sum() for ref, mask in zip(ref_splits, flow_loss_masks)], dim=0)
+            seq_old_log_prob = torch.stack([(old * mask).sum() for old, mask in zip(old_splits, flow_loss_masks)], dim=0)
 
-        # Apply TIS before sample mean calculation
-        if self.args.use_tis:
-            # Apply TIS off-policy correction using importance sampling
-            assert (
-                has_rollout_log_probs and rollout_log_probs is not None
-            ), "rollout_log_probs must be provided as non-empty torch.Tensor for TIS"
+            seq_rollout_log_prob_values = []
+            for rollout_split, mask, fallback in zip(rollout_splits, flow_loss_masks, seq_old_log_prob):
+                if rollout_split.numel() == 0:
+                    seq_rollout_log_prob_values.append(fallback.detach())
+                else:
+                    seq_rollout_log_prob_values.append((rollout_split * mask).sum())
+            seq_rollout_log_prob = torch.stack(seq_rollout_log_prob_values, dim=0)
 
-            tis = torch.exp(old_log_probs - rollout_log_probs)
-            ois = (-ppo_kl).exp()
-            tis_clip = torch.clamp(
-                tis, min=getattr(self.args, "tis_clip_low", 0.1), max=getattr(self.args, "tis_clip", 2.0)
+            seq_advantage = torch.stack(
+                [
+                    (adv * mask).sum() / mask.sum().clamp_min(1.0)
+                    for adv, mask in zip(adv_splits, flow_loss_masks)
+                ],
+                dim=0,
             )
-            tis_clipfrac = tis_clip != tis
 
-            pg_loss = pg_loss * tis_clip
+            final_hidden = hidden_states[-1].squeeze(0)
+            cu_seqlens = packed_batch["cu_seqlens"]
+            prompt_vectors = []
+            for idx, resp_len in enumerate(response_lengths):
+                start = cu_seqlens[idx].item()
+                end = cu_seqlens[idx + 1].item()
+                prompt_len = (end - start) - resp_len
+                anchor = max(start, end - resp_len - 1)
+                anchor = min(anchor, end - 1)
+                prompt_vectors.append(final_hidden[anchor])
+            if prompt_vectors:
+                prompt_hidden = torch.stack(prompt_vectors, dim=0)
+            else:
+                prompt_hidden = torch.empty(
+                    0,
+                    final_hidden.size(-1),
+                    device=final_hidden.device,
+                    dtype=final_hidden.dtype,
+                )
+            if self.args.flowrl_detach_prompt_hidden:
+                prompt_hidden = prompt_hidden.detach()
 
-        assert not self.args.calculate_per_token_loss, "calculate_per_token_loss not yet implemented"
-        pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
-        pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
-        ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
+            log_z = self.model.proj_z(prompt_hidden.to(dtype=logits.dtype)).to(torch.float32)
 
-        # Only compare rollout vs. train log probs when they originate from different stages.
-        train_rollout_logprob_abs_diff = None
-        if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
+            seq_log_prob = seq_log_prob.to(torch.float32)
+            seq_ref_log_prob = seq_ref_log_prob.to(torch.float32)
+            seq_old_log_prob = seq_old_log_prob.to(torch.float32)
+            seq_rollout_log_prob = seq_rollout_log_prob.to(torch.float32)
+            seq_advantage = seq_advantage.to(torch.float32)
+
+            seq_log_ratio = seq_log_prob - seq_ref_log_prob
+            residual = seq_log_ratio - (self.args.flowrl_beta * seq_advantage) + log_z
+            
+            # Clamp residual to prevent extreme values that could cause NaN when squared
+            residual = torch.clamp(residual, min=-50.0, max=50.0)
+
+            seq_rollout_log_prob = seq_rollout_log_prob.to(device=residual.device)
+            seq_old_log_prob = seq_old_log_prob.to(device=residual.device)
+
+            # Compute importance weight: exp(log p_old - log p_rollout)
+            # Clamp the log difference to prevent overflow in exp()
+            log_importance_ratio = seq_old_log_prob.detach() - seq_rollout_log_prob.detach()
+            log_importance_ratio = torch.clamp(log_importance_ratio, min=-20.0, max=20.0)
+            importance_weight = torch.exp(log_importance_ratio)
+            
+            # Apply symmetric clipping similar to PPO's clip_ratio
+            # Default to clip_ratio range if flowrl_max_importance_weight not set
+            if (
+                self.args.flowrl_max_importance_weight is not None
+                and self.args.flowrl_max_importance_weight > 0
+            ):
+                # Use user-specified max weight
+                importance_weight = torch.clamp(
+                    importance_weight, 
+                    min=1.0 / self.args.flowrl_max_importance_weight,
+                    max=self.args.flowrl_max_importance_weight
+                )
+            else:
+                # Default symmetric clipping based on eps_clip (similar to reference implementation)
+                clip_ratio = getattr(self.args, 'eps_clip', 0.2)
+                importance_weight = torch.clamp(
+                    importance_weight,
+                    min=1.0 - clip_ratio,
+                    max=1.0 + clip_ratio
+                )
+
+            flowrl_loss_per_sample = 0.5 * importance_weight * residual.pow(2)
+            flowrl_loss = flowrl_loss_per_sample.mean()
+
+            entropy_loss = entropy_loss.to(flowrl_loss.dtype)
+            loss = flowrl_loss - self.args.entropy_coef * entropy_loss
+
+            kl_loss = None
+            if self.args.use_kl_loss:
+                kl = compute_approx_kl(cur_log_probs, ref_log_probs, kl_loss_type=self.args.kl_loss_type)
+                kl_loss = sum_of_sample_mean(kl, response_lengths, flow_loss_masks)
+                loss = loss + self.args.kl_loss_coef * kl_loss
+
+            reported = {
+                "loss": loss.detach(),
+                "flowrl_loss": flowrl_loss.detach(),
+                "entropy_loss": entropy_loss.detach(),
+                "ppo_kl": ppo_kl.detach(),
+                "train_rollout_logprob_abs_diff": train_rollout_logprob_abs_diff,
+                "flowrl_residual": residual.detach().abs().mean(),
+                "flowrl_log_ratio": seq_log_ratio.detach().mean(),
+                "flowrl_log_z": log_z.detach().mean(),
+                "flowrl_importance_weight": importance_weight.detach().mean(),
+                "flowrl_advantage": seq_advantage.detach().mean(),
+            }
+            if kl_loss is not None:
+                reported["kl_loss"] = kl_loss.detach()
+
+            # Check for NaN/Inf before backward pass
+            if torch.isnan(loss) or torch.isinf(loss):
+                if dist.get_rank() == 0:
+                    print(f"[WARNING] NaN/Inf loss detected in FlowRL objective:")
+                    print(f"  flowrl_loss: {flowrl_loss.item()}")
+                    print(f"  entropy_loss: {entropy_loss.item()}")
+                    print(f"  residual (mean): {residual.mean().item()}, (max): {residual.max().item()}")
+                    print(f"  importance_weight (mean): {importance_weight.mean().item()}, (max): {importance_weight.max().item()}")
+                    print(f"  log_z (mean): {log_z.mean().item()}")
+                    if kl_loss is not None:
+                        print(f"  kl_loss: {kl_loss.item()}")
+                # Skip backward pass for this micro-batch
+                return
+
+            loss = loss * dist.get_world_size() / self.args.global_batch_size
+            loss.backward()
+        else:
+            advantages = advantages.to(device=log_probs.device)
+            ppo_kl = old_log_probs.to(device=log_probs.device) - log_probs
+
+            if self.args.advantage_estimator == "gspo":
+                log_ratio_splits = torch.split(ppo_kl, response_lengths, dim=0)
+
+                seq_kls = [
+                    ((log_ratio_i * mask_i).sum() / mask_i.sum().clamp_min(1))
+                    for log_ratio_i, mask_i in zip(log_ratio_splits, loss_masks)
+                ]
+
+                ppo_kl_list = []
+                for seq_kl, length in zip(seq_kls, response_lengths):
+                    ppo_kl_list.append(seq_kl.expand(length))
+
+                ppo_kl = torch.cat(ppo_kl_list)
+
+            pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+
+            rollout_log_probs = rollout_log_probs.to(device=log_probs.device)
+
+            # Apply TIS before sample mean calculation
+            if self.args.use_tis:
+                # Initialize TIS variables
+                tis = None
+                tis_clipfrac = None
+                ois = None
+                # Apply TIS off-policy correction using importance sampling
+                assert all(
+                    "rollout_log_probs" in batch
+                    and isinstance(batch["rollout_log_probs"], torch.Tensor)
+                    and batch["rollout_log_probs"].numel() > 0
+                    for batch in unpacked_batches
+                ), "rollout_log_probs must be provided as non-empty torch.Tensor for TIS"
+
+                tis = torch.exp(old_log_probs - rollout_log_probs)
+                ois = (-ppo_kl).exp()
+                tis_clip = torch.clamp(
+                    tis, min=getattr(self.args, "tis_clip_low", 0.1), max=getattr(self.args, "tis_clip", 2.0)
+                )
+                tis_clipfrac = tis_clip != tis
+
+                pg_loss = pg_loss * tis_clip
+
+            pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
+            pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
+            ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
+
             train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
             train_rollout_logprob_abs_diff = sum_of_sample_mean(
                 train_rollout_logprob_abs_diff, response_lengths, loss_masks
             ).detach()
 
-        entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
-        entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
+            entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
 
-        loss = pg_loss - self.args.entropy_coef * entropy_loss
+            loss = pg_loss - self.args.entropy_coef * entropy_loss
 
-        if self.args.use_kl_loss:
-            ref_log_probs = torch.cat([batch["ref_log_probs"] for batch in unpacked_batches], dim=0)
-            kl = compute_approx_kl(
-                log_probs,
-                ref_log_probs,
-                kl_loss_type=self.args.kl_loss_type,
-            )
-            kl_loss = sum_of_sample_mean(kl, response_lengths, loss_masks)
+            if self.args.use_kl_loss:
+                ref_log_probs = torch.cat([batch["ref_log_probs"] for batch in unpacked_batches], dim=0)
+                kl = compute_approx_kl(
+                    log_probs,
+                    ref_log_probs,
+                    kl_loss_type=self.args.kl_loss_type,
+                )
+                kl_loss = sum_of_sample_mean(kl, response_lengths, loss_masks)
 
-            loss = loss + self.args.kl_loss_coef * kl_loss
+                loss = loss + self.args.kl_loss_coef * kl_loss
 
-        reported = {
-            "loss": loss.detach(),
-            "pg_loss": pg_loss.detach(),
-            "pg_clipfrac": pg_clipfrac.detach(),
-            "ppo_kl": ppo_kl.detach(),
-            "entropy_loss": entropy_loss.detach(),
-        }
+            reported = {
+                "loss": loss.detach(),
+                "pg_loss": pg_loss.detach(),
+                "pg_clipfrac": pg_clipfrac.detach(),
+                "ppo_kl": ppo_kl.detach(),
+                "entropy_loss": entropy_loss.detach(),
+                "train_rollout_logprob_abs_diff": train_rollout_logprob_abs_diff,
+            }
 
-        if train_rollout_logprob_abs_diff is not None:
-            reported["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff
+            if self.args.use_kl_loss:
+                reported["kl_loss"] = kl_loss.detach()
 
-        if self.args.use_kl_loss:
-            reported["kl_loss"] = kl_loss.detach()
+            if self.args.use_tis and tis is not None:
+                reported["tis"] = sum_of_sample_mean(tis, response_lengths, loss_masks).detach()
+                reported["ois"] = sum_of_sample_mean(ois, response_lengths, loss_masks).detach()
+                reported["tis_clipfrac"] = sum_of_sample_mean(
+                    tis_clipfrac.float(), response_lengths, loss_masks
+                ).detach()
 
-        if self.args.use_tis and tis is not None:
-            reported["tis"] = sum_of_sample_mean(tis, response_lengths, loss_masks).detach()
-            reported["ois"] = sum_of_sample_mean(ois, response_lengths, loss_masks).detach()
-            reported["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac.float(), response_lengths, loss_masks).detach()
-
-        # Scale loss for gradient accumulation
-        loss = loss * self.dp_size / self.args.global_batch_size
-        loss.backward()
+            loss = loss * dist.get_world_size() / self.args.global_batch_size
+            loss.backward()
 
         # Accumulate reported metrics (store tensors for later mean)
         for k, v in reported.items():
@@ -720,9 +914,16 @@ class FSDPTrainRayActor(TrainRayActor):
 
                 kl_info = ""
                 if self.args.use_kl_loss and "kl_loss" in aggregated:
-                    kl_info = f", kl_loss: {aggregated['kl_loss']:.4f}, kl_penalty: {aggregated['kl_loss'] * self.args.kl_loss_coef:.4f}"
-                    logger.info(kl_info)
-                logger.info(f"step {self.global_step}: {log_dict}")
+                    kl_val = aggregated["kl_loss"]
+                    if self.args.use_flowrl_objective:
+                        print(
+                            f"KL stats -> kl_loss: {kl_val:.4f}, kl_penalty: {kl_val * self.args.kl_loss_coef:.4f}"
+                        )
+                    else:
+                        print(
+                            f"kl_loss: {kl_val:.4f}, kl_penalty: {kl_val * self.args.kl_loss_coef:.4f}"
+                        )
+                print(f"step {self.global_step}: {log_dict}")
 
                 log_dict["train/step"] = self.global_step
                 tracking_utils.log(self.args, log_dict, step_key="train/step")
@@ -745,51 +946,131 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
 
-        self.weight_updater.update_weights()
-        clear_memory()
+        with (
+            torch_memory_saver.disable()
+            if self.args.offload_train and self.args.offload_train_mode == "tms" and not torch.version.hip
+            else nullcontext()
+        ):
+            self.weight_updater.update_weights()
 
-    def _create_ref_model(self, ref_load_path: str | None):
-        """Create and initialize a separate reference model with FSDP2 CPUOffloadPolicy.
+    @torch.no_grad()
+    def update_cpu_params_dict(self, params_dict: dict[str, torch.Tensor]) -> None:
+        """Copy model parameters from GPU to a pinned CPU dictionary.
+
+        Parameters:
+            params_dict: Destination mapping from parameter names to CPU tensors.
+                Missing entries are allocated with matching shapes and dtypes.
+        """
+
+        state_dict = get_model_state_dict(self.model, options=self.fsdp_full_state_dict_opts)
+
+        for name, param in state_dict.items():
+            if not torch.is_tensor(param):
+                continue
+
+            if name not in params_dict:
+                params_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+            params_dict[name].copy_(param.detach(), non_blocking=True)
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def update_gpu_params_dict(self, params_dict: dict[str, torch.Tensor]) -> None:
+        """Load parameters from a CPU dictionary into the GPU model.
+
+        Parameters:
+            params_dict: Source mapping from parameter names to CPU tensors.
+
+        Note:
+            This method handles both regular Tensors and DTensors. For DTensors,
+            it properly distributes the full tensor according to FSDP sharding.
+        """
+        # Cache parameter and buffer maps for efficiency
+        if not hasattr(self, "_fsdp_param_map"):
+            self._fsdp_param_map = dict(self.model.named_parameters())
+            self._fsdp_buffer_map = dict(self.model.named_buffers())
+
+        param_map = self._fsdp_param_map
+        buffer_map = self._fsdp_buffer_map
+
+        for name, src in params_dict.items():
+            if not torch.is_tensor(src):
+                continue
+
+            target_param = param_map.get(name)
+            if target_param is None:
+                target_param = buffer_map.get(name)
+                if target_param is None:
+                    continue
+
+            dst_tensor = target_param.data
+
+            src_tensor = src.detach()
+            if src_tensor.device.type != "cpu":
+                src_tensor = src_tensor.to(device=torch.device("cpu"))
+            if src_tensor.dtype != dst_tensor.dtype:
+                src_tensor = src_tensor.to(dtype=dst_tensor.dtype)
+
+            if isinstance(dst_tensor, DTensor):
+                distributed = distribute_tensor(
+                    src_tensor.contiguous(),
+                    device_mesh=dst_tensor.device_mesh,
+                    placements=dst_tensor.placements,
+                )
+                dst_tensor.copy_(distributed)
+            else:
+                # Regular tensor: just move to GPU
+                dst_tensor.copy_(src_tensor.to(device=dst_tensor.device, non_blocking=True))
+
+        torch.cuda.synchronize()
+
+    def load_ref_model(self, ref_load_path: str | None) -> None:
+        """Load reference model weights once and cache them on CPU.
 
         Parameters:
             ref_load_path: Path to a directory containing a HF checkpoint. If
-                None, a ValueError is raised.
-
-        Returns:
-            FSDP2-wrapped ref model with CPU offload enabled
-
-        Note:
-            Creates a separate FSDP2 model instance for the reference model.
-            ALWAYS uses CPUOffloadPolicy for the reference model to save memory,
-            regardless of the actor model's CPU offload setting.
+                None, the reference model will be loaded from the base model (args.hf_checkpoint).
         """
-        if ref_load_path is None:
-            raise ValueError("ref_load_path must be provided when loading reference model")
-
         import os
 
-        if os.path.isdir(ref_load_path):
-            logger.info(f"[Rank {dist.get_rank()}] Creating separate ref model from {ref_load_path}")
-
-            init_context = self._get_init_weight_context_manager()
-
-            with init_context():
-                ref_model = AutoModelForCausalLM.from_pretrained(
-                    ref_load_path,
-                    trust_remote_code=True,
-                    attn_implementation=self.args.attn_implementation,
+        # Determine the path to load from
+        if ref_load_path is None or not os.path.exists(ref_load_path):
+            # Use base model path as fallback
+            load_path = self.args.hf_checkpoint
+            if ref_load_path is not None:
+                logger.warning(
+                    f"ref_load_path '{ref_load_path}' does not exist. "
+                    f"Loading reference model from base model: '{load_path}'"
                 )
-
-            full_state = ref_model.state_dict()
-
-            # Always use CPUOffloadPolicy for reference, let FSDP2 handle the offload. It is faster than model.cpu().
-            ref_model = apply_fsdp2(ref_model, mesh=self.dp_mesh, cpu_offload=True)
-            ref_model = self._fsdp2_load_full_state_dict(ref_model, full_state, self.dp_mesh, cpu_offload=True)
-
-            logger.info(f"[Rank {dist.get_rank()}] Reference model created with FSDP2 CPUOffloadPolicy")
-            return ref_model
+            else:
+                logger.info(f"No ref_load_path provided. Loading reference model from base model: '{load_path}'")
         else:
-            raise NotImplementedError(f"Loading from checkpoint file {ref_load_path} not yet implemented")
+            load_path = ref_load_path
+            logger.info(f"Loading reference model from: '{load_path}'")
+
+        if os.path.isdir(load_path):
+            # Get actor weights for dtype matching
+            actor_weights = self.weights["actor"]
+
+            temp_ref_model = AutoModelForCausalLM.from_pretrained(
+                load_path,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+            )
+            ref_state_dict = temp_ref_model.state_dict()
+            self.weights["ref"] = {}
+
+            for name, tensor in ref_state_dict.items():
+                actor_tensor = actor_weights.get(name)
+                target_dtype = actor_tensor.dtype if actor_tensor is not None else tensor.dtype
+                cpu_tensor = tensor.detach().to(device="cpu", dtype=target_dtype, copy=True)
+                self.weights["ref"][name] = cpu_tensor.pin_memory()
+
+            del temp_ref_model
+            torch.cuda.empty_cache()
+            logger.info(f"Reference model loaded from '{load_path}' and stored in CPU memory")
+        else:
+            raise NotImplementedError(f"Loading from checkpoint file {load_path} not yet implemented")
 
     def _get_model_inputs_args(self, packed_sequence: dict) -> dict:
         input_ids = packed_sequence["tokens"].unsqueeze(0)
@@ -996,20 +1277,22 @@ def move_torch_optimizer(optimizer, device):
     torch.cuda.synchronize()
 
 
-def apply_fsdp2(model, mesh=None, cpu_offload=False):
+def apply_fsdp2(model, mesh=None):
     """Apply FSDP v2 to the model.
 
     Args:
         model: The model to wrap with FSDP
         mesh: Optional DeviceMesh for FSDP. If None, uses all ranks.
-        cpu_offload: If True, offload parameters, gradients, and optimizer states
-            to CPU. The optimizer step will run on CPU. (Default: False)
 
     Ref: https://github.com/volcengine/verl/blob/main/verl/utils/fsdp_utils.py
     """
-    from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
-
-    offload_policy = CPUOffloadPolicy() if cpu_offload else None
+    # Import FSDP v2 components based on PyTorch version
+    if version.parse(torch.__version__) >= version.parse("2.6"):
+        from torch.distributed.fsdp import fully_shard
+    elif version.parse(torch.__version__) >= version.parse("2.4"):
+        from torch.distributed._composable.fsdp import fully_shard
+    else:
+        raise ImportError("FSDP v2 not available")
 
     layer_cls_to_wrap = model._no_split_modules
     assert len(layer_cls_to_wrap) > 0 and layer_cls_to_wrap[0] is not None
@@ -1021,20 +1304,8 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False):
         or (isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings)
     ]
 
-    fsdp_kwargs = {
-        "mp_policy": MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        ),
-        "offload_policy": offload_policy,
-        "mesh": mesh,
-    }
-
-    # Apply FSDP to each module (offload_policy=None is equivalent to not passing it)
-    for module in modules:
-        fully_shard(module, **fsdp_kwargs)
-
-    # Apply FSDP to the top-level model
-    fully_shard(model, **fsdp_kwargs)
+    for idx, module in enumerate(modules):
+        fully_shard(module, mesh=mesh)
+    fully_shard(model, mesh=mesh)
 
     return model

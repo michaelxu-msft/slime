@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+run_flowrl_*.sh
 
 # C extensions
 *.so

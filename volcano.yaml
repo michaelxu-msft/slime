@@ -1,0 +1,259 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  generateName: michaelxu-flowrl-
+  namespace: msr-redmond
+spec:
+  minAvailable: 1
+  schedulerName: volcano
+  queue: msr-redmond
+  plugins:
+    ssh: []
+    svc: []
+    env: []        # VC_* envs (host lists, etc.)
+    pytorch: []    # set standard torch env vars
+  policies:
+    - event: TaskCompleted
+      action: CompleteJob
+  tasks:
+    - replicas: 1
+      name: master
+      template:
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          restartPolicy: Never
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: pvc-local-msr-redmond-01
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 100Gi
+          tolerations:
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+          imagePullSecrets:
+            - name: nlpaml
+          containers:
+            - name: master
+              image: nlpaml.azurecr.io/slimerl/slime:latest
+              imagePullPolicy: Always
+              securityContext:
+                privileged: true
+              env:
+                - name: WANDB_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: michaelxu-wandb
+                      key: api-key
+                - name: WANDB_HOST
+                  value: "https://microsoft-research.wandb.io"
+                - name: WANDB_PROJECT
+                  value: "Volcano-Slime-FlowRL-MATH"
+                - name: GLOO_SOCKET_IFNAME
+                  value: "eno1"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eno1"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_HCA
+                  value: "mlx5"
+              resources:
+                requests:
+                  cpu: "180"
+                  memory: "2600Gi"
+                  nvidia.com/gpu: "8"
+                  rdma/rdma_shared_device_a: "1"
+                limits:
+                  cpu: "180"
+                  memory: "2600Gi"
+                  nvidia.com/gpu: "8"
+                  rdma/rdma_shared_device_a: "1"
+              command:
+                - /bin/bash
+                - "-c"
+                - |
+                  set -x
+                  
+                  echo "Starting Ray head node at $VC_MASTER_HOSTS"
+                  ray start --head --node-ip-address $VC_MASTER_HOSTS --port=6379 --num-gpus=8 --disable-usage-stats
+                  
+                  # Wait for worker nodes to join
+                  DESIRED_NODES=$((VC_WORKER_NUM + 1))
+                  NODE_COUNT=0
+                  echo "Waiting for ${DESIRED_NODES} nodes to join Ray cluster..."
+                  while [[ "$NODE_COUNT" -lt "$DESIRED_NODES" ]]; do
+                    NODE_COUNT=$(ray status 2>/dev/null | grep -oP 'node_' | wc -l || echo "0")
+                    echo "Current nodes: $NODE_COUNT / $DESIRED_NODES"
+                    sleep 5
+                  done
+                  echo "Ray cluster ready with ${DESIRED_NODES} nodes!"
+                  
+                  # Run init.sh on head node
+                  cd /workspace/slime
+                  
+                  # Comment out @jit_fuser decorator at line 47 in Megatron-LM
+                  if [ -f "/root/Megatron-LM/megatron/core/fusions/fused_cross_entropy.py" ]; then
+                    echo "Commenting out @jit_fuser decorator at line 47 in Megatron-LM..."
+                    sed -i '47s/^@jit_fuser$/#@jit_fuser/' /root/Megatron-LM/megatron/core/fusions/fused_cross_entropy.py
+                    echo "Done patching Megatron-LM"
+                  fi
+
+                  # Disable non-blocking CPU transfers during async checkpoint preloads
+                  if [ -f "/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/filesystem_async.py" ]; then
+                    echo "Setting Megatron filesystem_async non_blocking flag to False..."
+                    sed -i 's/tensor.to("cpu", non_blocking=non_blocking)/tensor.to("cpu", non_blocking=False)/' \
+                      /root/Megatron-LM/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+                    echo "Megatron filesystem_async patched"
+                  fi
+                  
+                  # Create log directory with timestamp
+                  LOG_DIR="/data/users/michaelxu/logs/$(date +%Y%m%d_%H%M%S)_${HOSTNAME}"
+                  mkdir -p "$LOG_DIR"
+                  echo "Logs will be saved to: $LOG_DIR"
+                  
+                  # Example: Qwen2.5-7B on math task with FlowRL
+                  bash init.sh Qwen2.5-7B math \
+                    --use-flowrl \
+                    --tp-size 1 \
+                    --pp-size 1 \
+                    --cp-size 1 \
+                    --rollout-gpus $((DESIRED_NODES * 4)) \
+                    --num-nodes $DESIRED_NODES \
+                    --num-gpus 8 \
+                    --node-rank 0 \
+                    --head-addr $VC_MASTER_HOSTS \
+                    --head-port 6379 \
+                    --datasets-path /data/users/michaelxu/datasets \
+                    --models-path /data/users/michaelxu/models \
+                    --checkpoints-path /data/users/michaelxu/checkpoints \
+                    2>&1 | tee "$LOG_DIR/training.log"
+                  
+                  # Save exit code
+                  EXIT_CODE=${PIPESTATUS[0]}
+                  echo "Training completed with exit code: $EXIT_CODE" | tee -a "$LOG_DIR/training.log"
+                  
+                  # Save Ray status and logs
+                  ray status > "$LOG_DIR/ray_status.txt" 2>&1 || true
+                  
+                  exit $EXIT_CODE
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                - name: dshm
+                  mountPath: /dev/shm
+    
+    - replicas: 0  # Set to N-1 for N total nodes
+      name: worker
+      template:
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          restartPolicy: Never
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: pvc-local-msr-redmond-01
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 100Gi
+          tolerations:
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+          imagePullSecrets:
+            - name: nlpaml
+          containers:
+            - name: worker
+              image: nlpaml.azurecr.io/slimerl/slime:latest
+              imagePullPolicy: Always
+              securityContext:
+                privileged: true
+              env:
+                - name: WANDB_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: michaelxu-wandb
+                      key: api-key
+                - name: WANDB_HOST
+                  value: "https://microsoft-research.wandb.io"
+                - name: WANDB_PROJECT
+                  value: "Volcano-Slime-FlowRL-MATH"
+                - name: GLOO_SOCKET_IFNAME
+                  value: "eno1"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eno1"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_HCA
+                  value: "mlx5"
+              resources:
+                requests:
+                  cpu: "180"
+                  memory: "2600Gi"
+                  nvidia.com/gpu: "8"
+                  rdma/rdma_shared_device_a: "1"
+                limits:
+                  cpu: "180"
+                  memory: "2600Gi"
+                  nvidia.com/gpu: "8"
+                  rdma/rdma_shared_device_a: "1"
+              command:
+                - /bin/bash
+                - "-c"
+                - |
+                  set -x
+                  
+                  # Get this worker's IP address from eno1 interface
+                  WORKER_IP=$(ip addr show eno1 | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+                  echo "Worker IP: $WORKER_IP"
+                  
+                  # Create log directory for this worker
+                  LOG_DIR="/data/users/michaelxu/logs/$(date +%Y%m%d_%H%M%S)_worker_${HOSTNAME}"
+                  mkdir -p "$LOG_DIR"
+                  
+                  # Redirect all output to log file
+                  exec > >(tee "$LOG_DIR/worker.log") 2>&1
+                  
+                  # Disable non-blocking CPU transfers during async checkpoint preloads
+                  if [ -f "/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/filesystem_async.py" ]; then
+                    echo "Setting Megatron filesystem_async non_blocking flag to False..."
+                    sed -i 's/tensor.to("cpu", non_blocking=non_blocking)/tensor.to("cpu", non_blocking=False)/' \
+                      /root/Megatron-LM/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+                    echo "Megatron filesystem_async patched"
+                  fi
+
+                  # Wait for Ray head node
+                  export HEAD_NODE_PORT=6379
+                  echo "Waiting for Ray head node at ${VC_MASTER_HOSTS}:${HEAD_NODE_PORT}..."
+                  
+                  while true; do
+                    if nc -z $VC_MASTER_HOSTS $HEAD_NODE_PORT 2>/dev/null; then
+                      echo "Ray head node is available. Joining cluster..."
+                      ray start --address=$VC_MASTER_HOSTS:$HEAD_NODE_PORT \
+                        --node-ip-address=$WORKER_IP \
+                        --num-gpus=8 \
+                        --disable-usage-stats
+                      if [ $? -eq 0 ]; then
+                        echo "Successfully joined Ray cluster!"
+                        break
+                      else
+                        echo "Failed to join. Retrying..."
+                      fi
+                    else
+                      echo "Head node not ready yet. Retrying..."
+                    fi
+                    sleep 5
+                  done
+                  
+                  echo "Ray worker joined cluster. Waiting for work..."
+                  sleep infinity
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                - name: dshm
+                  mountPath: /dev/shm
